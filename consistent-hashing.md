@@ -1,0 +1,1 @@
+https://bytebytego.com/courses/system-design-interview/design-consistent-hashing
