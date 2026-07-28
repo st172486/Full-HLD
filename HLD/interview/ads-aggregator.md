@@ -88,7 +88,7 @@ This prevents ID enumeration attacks.
 >
 > The browser should only know the **Click URL**. Every click must pass through the **Click Service**, which logs the click, publishes the event, and finally redirects the user using an **HTTP 302 Redirect**.
 
- ![neive-solution](image12-.png)
+ ![neive-solution](image-12.png)
 
  # Why Not Use a Single PostgreSQL Database?
 
