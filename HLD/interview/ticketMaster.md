@@ -980,3 +980,744 @@ This answer demonstrates that you understand:
 - Why Redis is introduced at large scale.
 - The trade-offs between simplicity and scalability.
 - Why PostgreSQL should remain the authoritative data store while Redis handles temporary locks.
+
+# Ticketmaster System Design Notes: Database Sharding Strategy
+
+## Why Do We Need Sharding?
+
+A Ticketmaster-like system has to handle:
+
+- Millions of users
+- Millions of bookings
+- Thousands of concurrent reservation requests
+- Very high read and write throughput
+
+A single PostgreSQL instance eventually becomes a bottleneck because:
+
+- CPU utilization increases
+- Disk I/O increases
+- Memory becomes insufficient
+- Write throughput reaches its limit
+- Database size grows into terabytes
+
+To scale horizontally, we partition (shard) the database.
+
+---
+
+# What is Sharding?
+
+Sharding means splitting one logical database into multiple physical databases.
+
+Instead of storing all records in one database:
+
+```
+                PostgreSQL
+          -----------------------
+          Events
+          Tickets
+          Reservations
+          Bookings
+```
+
+we split the data.
+
+```
+                Shard 1
+          ----------------
+          Events
+          Tickets
+          Reservations
+
+                Shard 2
+          ----------------
+          Events
+          Tickets
+          Reservations
+
+                Shard 3
+          ----------------
+          Events
+          Tickets
+          Reservations
+```
+
+Each shard stores only a subset of the data.
+
+---
+
+# The Most Important Question
+
+The first question during sharding is:
+
+> **What should be the shard key?**
+
+The shard key determines where every row will be stored.
+
+Choosing the wrong shard key can completely destroy scalability.
+
+---
+
+# Candidate 1: Shard by Ticket ID ❌
+
+Example:
+
+```
+Shard = hash(ticketId)
+```
+
+Suppose we have:
+
+```
+Seat A1
+
+Seat A2
+
+Seat A3
+```
+
+They may end up in different shards.
+
+```
+A1 → Shard 1
+
+A2 → Shard 4
+
+A3 → Shard 2
+```
+
+Now a user wants to book:
+
+```
+A1
+A2
+A3
+```
+
+The Booking Service must contact:
+
+```
+Shard 1
+
+Shard 4
+
+Shard 2
+```
+
+The booking now becomes a distributed transaction.
+
+Distributed transactions are:
+
+- Slow
+- Complex
+- Difficult to recover
+- Hard to scale
+
+Therefore:
+
+**Ticket ID is a poor shard key.**
+
+---
+
+# Candidate 2: Shard by User ID ❌
+
+Example:
+
+```
+Shard = hash(userId)
+```
+
+This strategy works very well for systems like:
+
+- Facebook
+- Instagram
+- Twitter
+
+because almost every request belongs to one user.
+
+However, Ticketmaster traffic is different.
+
+Suppose:
+
+```
+Taylor Swift Concert
+
+Seat A10
+```
+
+10,000 users try to reserve the same seat.
+
+Because users hash differently:
+
+```
+User 1 → Shard 2
+
+User 2 → Shard 5
+
+User 3 → Shard 8
+
+User 4 → Shard 1
+```
+
+Now all shards compete to reserve the same seat.
+
+This creates enormous synchronization problems.
+
+Therefore:
+
+**User ID is not a good shard key for booking.**
+
+---
+
+# Candidate 3: Shard by Venue ❌ (Usually)
+
+Example:
+
+```
+Shard = venueId
+```
+
+Initially this looks reasonable.
+
+All events in one venue remain together.
+
+Example:
+
+```
+Madison Square Garden
+
+↓
+
+Shard 3
+```
+
+However,
+
+One venue may host hundreds of concerts.
+
+If the venue is famous:
+
+```
+MSG
+
+↓
+
+500 events
+
+↓
+
+Millions of users
+```
+
+One shard becomes overloaded.
+
+This is called a **hot shard**.
+
+---
+
+# Candidate 4: Shard by Event ID ✅
+
+This is the standard solution.
+
+```
+Shard = hash(eventId)
+```
+
+Example:
+
+```
+Coldplay Concert
+
+eventId = 100
+
+↓
+
+Shard 2
+```
+
+Everything related to that event stays together.
+
+```
+Event
+
+↓
+
+Seats
+
+↓
+
+Reservations
+
+↓
+
+Bookings
+```
+
+All data lives inside one shard.
+
+No distributed transactions are required.
+
+---
+
+# Why Event ID Works
+
+Suppose a user books:
+
+```
+A10
+
+A11
+
+A12
+```
+
+All three seats belong to:
+
+```
+Event 100
+```
+
+Therefore:
+
+```
+All seats
+
+↓
+
+Same shard
+```
+
+Booking is completely local.
+
+Only one database needs to be updated.
+
+---
+
+# Recommended Data Model
+
+Instead of storing:
+
+```
+Ticket
+```
+
+store:
+
+```
+EventSeat
+```
+
+Example:
+
+```
+EventSeat
+
+eventId
+
+seatId
+
+price
+
+status
+
+reservationId
+```
+
+Partition using:
+
+```
+hash(eventId)
+```
+
+Now every seat belonging to the same event lives together.
+
+---
+
+# Tables That Stay Together
+
+Each shard stores:
+
+```
+Event
+
+↓
+
+EventSeat
+
+↓
+
+Reservation
+
+↓
+
+Booking
+
+↓
+
+Payment Reference
+```
+
+Everything required for booking stays local.
+
+---
+
+# Search is Not Affected
+
+Searching does not use PostgreSQL.
+
+Architecture:
+
+```
+PostgreSQL
+
+↓
+
+CDC
+
+↓
+
+Elasticsearch
+
+↓
+
+Search Service
+```
+
+When users search:
+
+```
+Coldplay
+
+Mumbai
+
+Tomorrow
+
+Rock Concert
+```
+
+The Search Service queries Elasticsearch.
+
+No booking shard is involved.
+
+---
+
+# What About Multiple Events?
+
+Suppose there are:
+
+```
+Coldplay
+
+Taylor Swift
+
+IPL Final
+
+FIFA Final
+```
+
+Hashing distributes them.
+
+```
+Coldplay
+
+↓
+
+Shard 1
+
+Taylor Swift
+
+↓
+
+Shard 4
+
+IPL
+
+↓
+
+Shard 2
+
+FIFA
+
+↓
+
+Shard 5
+```
+
+Traffic naturally spreads across the cluster.
+
+---
+
+# The Hot Shard Problem
+
+Now imagine:
+
+```
+Taylor Swift Concert
+
+2 million users
+
+Only one event
+```
+
+Hashing by Event ID means:
+
+```
+Every request
+
+↓
+
+One shard
+```
+
+No hashing algorithm can split one key across multiple shards.
+
+This is called a **Hot Partition** or **Hot Shard**.
+
+---
+
+# Solution 1: Partition by Event + Section
+
+Instead of:
+
+```
+Shard = eventId
+```
+
+use:
+
+```
+Shard = eventId + section
+```
+
+Example:
+
+```
+VIP
+
+↓
+
+Shard 1
+
+Gold
+
+↓
+
+Shard 2
+
+Silver
+
+↓
+
+Shard 3
+
+General
+
+↓
+
+Shard 4
+```
+
+Now different seat sections are handled independently.
+
+Booking VIP seats does not affect General Admission.
+
+---
+
+# Solution 2: Waiting Room (Virtual Queue)
+
+Instead of allowing:
+
+```
+2 million users
+
+↓
+
+Booking Service
+```
+
+introduce a queue.
+
+```
+Users
+
+↓
+
+Waiting Room
+
+↓
+
+Booking Service
+```
+
+Only a controlled number of users enter the booking flow.
+
+Benefits:
+
+- Prevents traffic spikes
+- Protects the database
+- Prevents service crashes
+- Reduces contention
+
+This is how Ticketmaster handles extremely popular events.
+
+---
+
+# Solution 3: Redis Locking
+
+Booking requests first acquire a lock.
+
+```
+Client
+
+↓
+
+Booking Service
+
+↓
+
+Redis Lock
+
+↓
+
+Database
+```
+
+Redis ensures:
+
+- Only one reservation attempt for a seat succeeds at a time.
+- Concurrent users do not overwrite each other.
+- The database receives fewer conflicting writes.
+
+Redis does **not** replace the database.
+
+It simply manages temporary seat locks.
+
+---
+
+# Complete Architecture
+
+```
+                Client
+                   │
+                   ▼
+             API Gateway
+                   │
+       ------------------------
+       │          │           │
+       ▼          ▼           ▼
+ Search      Event CRUD   Booking Service
+                               │
+                        Acquire Redis Lock
+                               │
+                               ▼
+                        PostgreSQL Shard
+                               │
+                               ▼
+                        CDC → Elasticsearch
+```
+
+Search traffic is served by Elasticsearch.
+
+Booking traffic goes to the appropriate database shard.
+
+---
+
+# Advantages of Event ID Sharding
+
+✅ Booking remains local.
+
+✅ No distributed transactions.
+
+✅ Reservations stay together.
+
+✅ Bookings stay together.
+
+✅ Payments remain associated with the same event.
+
+✅ Easy to scale horizontally.
+
+---
+
+# Limitations
+
+Even Event ID sharding has limitations.
+
+Very popular events create:
+
+- Hot shards
+- High write contention
+- Large booking spikes
+
+These are solved using:
+
+- Waiting Room
+- Redis Locks
+- Event Section partitioning
+- Rate Limiting
+- Read Caching
+
+---
+
+# Comparison of Shard Keys
+
+| Shard Key | Good Choice? | Reason |
+|------------|--------------|--------|
+| Ticket ID | ❌ | Seats of one booking end up on different shards, causing distributed transactions. |
+| User ID | ❌ | Thousands of users compete for the same seat across different shards. |
+| Venue ID | ⚠️ | One popular venue can become a hotspot with many events. |
+| Event ID | ✅ | All seats, reservations, and bookings for an event stay together. |
+
+---
+
+# Final Recommendation
+
+For a Ticketmaster-like booking platform:
+
+### Transaction Database
+
+```
+Shard Key = hash(eventId)
+```
+
+Store together:
+
+```
+Event
+
+↓
+
+EventSeat
+
+↓
+
+Reservation
+
+↓
+
+Booking
+
+↓
+
+Payment Reference
+```
+
+For extremely popular events:
+
+- Introduce a waiting room.
+- Use Redis for seat locking.
+- Partition very large events by seat section (VIP, Gold, Silver, etc.).
+- Use Elasticsearch for search.
+- Use CDC to synchronize PostgreSQL with Elasticsearch.
+
+This architecture keeps booking operations local to a single shard while allowing the overall system to scale horizontally.
+
+---
+
+# Interview Answer
+
+If an interviewer asks:
+
+> **"What shard key would you choose?"**
+
+A strong answer is:
+
+> "I would shard the transactional database by `eventId` because bookings, reservations, and seat inventory are naturally scoped to a single event. This ensures that all writes for a booking remain local to one shard and avoids distributed transactions. However, very popular events can create hot shards, so I would complement this design with a waiting room to throttle traffic, Redis for distributed seat locking, and, if required, sub-partition a single event by seat sections such as VIP, Gold, and General Admission. Search would be completely decoupled using Elasticsearch synchronized from PostgreSQL via CDC."
