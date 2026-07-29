@@ -382,3 +382,601 @@ throughput - Very low latency
     unnecessarily.
 -   Returning alternative seat suggestions significantly improves user
     experience.
+
+# Ticketmaster System Design Notes: Cron Job vs Redis for Reservation Expiration
+
+## Problem Statement
+
+In a ticket booking system, users first **reserve** seats before making the payment. Since payment can take several minutes, we need a mechanism to automatically release seats if the user never completes the payment.
+
+The question is:
+
+> Should we use a cron job that periodically scans the database for expired reservations, or should we use Redis with TTL?
+
+The answer is that **both approaches are valid**, but they have different trade-offs depending on the scale of the system.
+
+---
+
+# Approach 1: Database + Cron Job
+
+## Ticket Table
+
+```text
+Ticket
+------
+id
+eventId
+seat
+price
+status
+reservedTimestamp
+userId
+```
+
+Possible ticket states:
+
+```
+AVAILABLE
+RESERVED
+BOOKED
+```
+
+---
+
+# Reserve Flow
+
+When a user reserves a seat:
+
+```sql
+UPDATE Ticket
+SET
+    status = 'RESERVED',
+    reservedTimestamp = NOW(),
+    userId = 123
+WHERE id = 10;
+```
+
+The seat is now locked for the user.
+
+---
+
+# Confirm Flow
+
+After successful payment:
+
+```sql
+UPDATE Ticket
+SET status = 'BOOKED'
+WHERE id = 10;
+```
+
+---
+
+# Expiration Flow
+
+A cron job runs periodically.
+
+Example:
+
+```sql
+SELECT *
+FROM Ticket
+WHERE status = 'RESERVED'
+AND reservedTimestamp < NOW() - INTERVAL '10 minutes';
+```
+
+For every expired reservation:
+
+```sql
+UPDATE Ticket
+SET
+    status = 'AVAILABLE',
+    reservedTimestamp = NULL,
+    userId = NULL;
+```
+
+The seat becomes available again.
+
+---
+
+# Architecture
+
+```
+Client
+    │
+Reserve Seat
+    │
+    ▼
+Booking Service
+    │
+    ▼
+PostgreSQL
+    │
+    ▼
+Cron Job
+    │
+Release expired reservations
+```
+
+---
+
+# Advantages of Cron Job
+
+### 1. Very Simple
+
+No extra infrastructure.
+
+Only PostgreSQL is required.
+
+---
+
+### 2. Easy to Understand
+
+The reservation lifecycle is entirely stored inside the database.
+
+```
+AVAILABLE
+      │
+      ▼
+RESERVED
+      │
+      ▼
+BOOKED
+```
+
+---
+
+### 3. Database is the Source of Truth
+
+Everything is stored in one place.
+
+No synchronization problems.
+
+---
+
+### 4. Works Well for Small and Medium Scale
+
+Examples:
+
+- Movie booking
+- Hotel booking
+- Airline booking
+- Internal reservation systems
+
+For thousands or even hundreds of thousands of reservations per day, this approach is perfectly acceptable.
+
+---
+
+# Problems with Cron Jobs at Large Scale
+
+Although this design works, it starts breaking down when the traffic becomes extremely high.
+
+Imagine:
+
+```
+Taylor Swift Concert
+
+100,000 seats
+
+20 million users
+
+Millions of reservation requests
+```
+
+Now the limitations become obvious.
+
+---
+
+# Problem 1: Seat Release is Delayed
+
+Suppose reservation expires at:
+
+```
+10:00:00
+```
+
+Cron runs every minute:
+
+```
+10:01:00
+```
+
+The seat remains unavailable for one extra minute.
+
+Another user trying to reserve at:
+
+```
+10:00:20
+```
+
+will still see:
+
+```
+Seat Reserved
+```
+
+even though the reservation should already have expired.
+
+---
+
+If cron runs every 5 seconds:
+
+```
+Maximum delay = 5 seconds
+```
+
+Better, but still not real-time.
+
+---
+
+# Problem 2: Database Scans Become Expensive
+
+Imagine:
+
+```
+5 million RESERVED rows
+```
+
+Every cron execution performs:
+
+```sql
+SELECT *
+FROM Ticket
+WHERE status='RESERVED'
+AND reservedTimestamp < NOW();
+```
+
+Even with indexes:
+
+- Index lookup
+- Disk I/O
+- Row filtering
+
+must happen repeatedly.
+
+As traffic grows, this becomes expensive.
+
+---
+
+# Problem 3: Continuous Writes
+
+Every reservation causes multiple database updates.
+
+Example:
+
+```
+Reserve
+
+↓
+
+Reservation expires
+
+↓
+
+Cron updates ticket
+
+↓
+
+Another reservation
+
+↓
+
+Cron updates again
+```
+
+Millions of unnecessary writes occur every day.
+
+---
+
+# Problem 4: Primary Database Load
+
+If cron runs frequently:
+
+```
+Every second
+
+Every 2 seconds
+
+Every 5 seconds
+```
+
+The primary database constantly processes expiration scans and updates.
+
+Instead of serving customer traffic, it spends resources cleaning expired reservations.
+
+---
+
+# Redis Approach
+
+Redis changes how expiration is handled.
+
+Instead of asking:
+
+> Which reservations have expired?
+
+Redis automatically tracks expiration for every reservation.
+
+---
+
+# Reserve Flow
+
+Suppose the reservation lasts for 10 minutes.
+
+Store:
+
+```
+reservation:123
+```
+
+with
+
+```
+TTL = 600 seconds
+```
+
+Example:
+
+```
+SET reservation:123 value EX 600
+```
+
+Redis now knows exactly when this reservation expires.
+
+No periodic scanning is required.
+
+---
+
+# Automatic Expiration
+
+After 600 seconds:
+
+```
+reservation:123
+```
+
+is automatically removed.
+
+Redis internally manages expiration.
+
+No cron job scans millions of records.
+
+---
+
+# Using Redis Sorted Sets
+
+Another common technique is storing reservations in a Sorted Set.
+
+```
+Seat A10 → 10:10
+
+Seat A11 → 10:12
+
+Seat A12 → 10:20
+```
+
+The score is simply the expiration timestamp.
+
+Worker fetches only expired reservations:
+
+```
+ZRANGEBYSCORE
+score <= currentTime
+```
+
+Instead of scanning every reservation, Redis directly returns only the expired ones.
+
+Complexity becomes approximately:
+
+```
+O(log N)
+```
+
+instead of scanning millions of rows.
+
+---
+
+# Does Redis Alone Make the Seat Available Again?
+
+No.
+
+This is a very common misconception.
+
+When Redis removes a key after TTL, PostgreSQL still contains:
+
+```
+status = RESERVED
+```
+
+Some process still needs to update the database.
+
+Redis only tells us:
+
+> This reservation has expired.
+
+The database still needs to be updated.
+
+---
+
+# Recommended Architecture
+
+Redis acts only as a **temporary lock manager**.
+
+PostgreSQL remains the source of truth.
+
+```
+Reserve Request
+
+↓
+
+Acquire Redis Lock
+
+↓
+
+Update PostgreSQL
+status = RESERVED
+
+↓
+
+Return Reservation
+```
+
+---
+
+# Confirmation Flow
+
+```
+Payment Successful
+
+↓
+
+Update PostgreSQL
+
+status = BOOKED
+
+↓
+
+Delete Redis Lock
+```
+
+---
+
+# Expiration Flow
+
+```
+Redis TTL expires
+
+↓
+
+Expiration Event / Background Worker
+
+↓
+
+Update PostgreSQL
+
+status = AVAILABLE
+
+↓
+
+Delete reservation record (optional)
+```
+
+---
+
+# Why PostgreSQL Should Remain the Source of Truth
+
+Redis is an in-memory system.
+
+Although Redis supports persistence, it is primarily optimized for speed.
+
+Permanent business data should still live in PostgreSQL.
+
+The database contains:
+
+- reservations
+- bookings
+- payments
+- tickets
+- audit history
+
+Redis contains only temporary reservation locks.
+
+---
+
+# Comparison
+
+| Feature | Cron Job | Redis TTL |
+|----------|----------|-----------|
+| Simplicity | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ |
+| Extra Infrastructure | None | Redis Cluster |
+| Real-Time Expiration | ❌ No | ✅ Yes |
+| Database Scans | Heavy | None |
+| Database Writes | High | Lower |
+| Scalability | Medium | Very High |
+| Suitable for Millions of Users | Difficult | Excellent |
+
+---
+
+# Which One Should You Choose?
+
+## Small Scale
+
+Examples:
+
+- Local movie booking
+- Internal company booking system
+- Startup ticket platform
+
+Recommended:
+
+```
+Database + Cron Job
+```
+
+Simple.
+
+Reliable.
+
+Easy to maintain.
+
+---
+
+## Medium Scale
+
+Examples:
+
+- BookMyShow (regional)
+- Event platforms
+
+Either approach works.
+
+Choice depends on expected traffic.
+
+---
+
+## Very Large Scale
+
+Examples:
+
+- Ticketmaster
+- Taylor Swift Concert
+- FIFA World Cup
+- IPL Finals
+- Olympics
+
+Recommended:
+
+```
+Redis
+
++
+
+PostgreSQL
+```
+
+Redis provides:
+
+- extremely fast locking
+- automatic expiration
+- no database scans
+- lower write load
+- excellent scalability
+
+while PostgreSQL stores all permanent booking information.
+
+---
+
+# Interview Answer
+
+If an interviewer asks:
+
+> "Why not simply use a cron job?"
+
+A strong answer is:
+
+> "A cron job is a perfectly valid solution for small and medium-scale systems because it keeps the architecture simple and the database remains the single source of truth. However, at Ticketmaster scale, continuously scanning millions of reservations introduces unnecessary database reads, delayed seat release, and additional write load. Redis provides in-memory locks with TTLs, allowing reservations to expire efficiently without scanning the database. I would use PostgreSQL as the source of truth and Redis only for temporary reservation locks and expiration management."
+
+This answer demonstrates that you understand:
+- Why the cron job approach is correct.
+- Why Redis is introduced at large scale.
+- The trade-offs between simplicity and scalability.
+- Why PostgreSQL should remain the authoritative data store while Redis handles temporary locks.
