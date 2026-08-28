@@ -1,4 +1,4 @@
-![alt text](image-42.png)
+![alt text](./images/image-42.png)
 ![alt text](image-43.png)
 ![alt text](image-44.png)
 ![alt text](image-45.png)
