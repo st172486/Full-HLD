@@ -1,5 +1,7 @@
 There are many questions un-answered here... need to read this again.
 
+![alt text](image-39.png)
+
 ![alt text](image-33.png)
 - this is the first screenshot and if you see our non-functional requirement we want consistency for swipes right but cassandra is known for its eventual consistency.... So it is possible that if two users swipes right at the sametime no one will ever know that they swiped eachother.
 
@@ -1981,3 +1983,1332 @@ If Redis disappears, the application becomes slower, **not incorrect**. That is 
 
 
 
+------------------------- Most important -----------------------------------------
+
+# Tinder Swipe & Match Service Design (Cassandra + Kafka)
+*A Production-Scale Distributed System Design*
+
+---
+
+# Table of Contents
+
+1. Introduction
+2. Requirements
+3. Scale Estimation
+4. High-Level Architecture
+5. Why Cassandra?
+6. Swipe Service Design
+7. Cassandra Data Modeling
+8. Cassandra Internals
+9. Write Path
+10. Read Path
+11. Match Service Design
+12. Kafka Integration
+13. Failure Scenarios
+14. Outbox Pattern in Cassandra
+15. Exactly Once vs At Least Once
+16. Idempotency
+17. Scaling Strategy
+18. Database Schema
+19. API Design
+20. Complete Request Flow
+21. Future Improvements
+22. Interview Discussion Points
+
+---
+
+# 1. Introduction
+
+The goal is to design the backend responsible for:
+
+- Recording every swipe.
+- Detecting mutual likes.
+- Creating a match.
+- Triggering downstream services.
+
+This design focuses only on
+
+- Swipe
+- Match
+
+Not included:
+
+- Recommendation Engine
+- Discovery Feed
+- Chat
+- Video Calls
+- User Profile
+- Authentication
+
+---
+
+# 2. Functional Requirements
+
+## Swipe
+
+Users should be able to
+
+- Swipe Left
+- Swipe Right
+- Super Like
+
+---
+
+Every swipe should
+
+- be persisted
+- never be lost
+- be idempotent
+- be available for future lookups
+
+---
+
+System should detect
+
+```
+A likes B
+
+AND
+
+B likes A
+
+↓
+
+MATCH
+```
+
+---
+
+After a match
+
+- Notify users
+- Enable chat
+- Update analytics
+
+---
+
+# 3. Non Functional Requirements
+
+Very high write throughput.
+
+Example scale
+
+```
+500 Million Users
+
+150 Million Daily Active Users
+
+20 Billion Swipes / Day
+
+Peak
+
+~1 Million Writes/sec
+```
+
+Requirements
+
+- Horizontal Scaling
+- High Availability
+- Fault Tolerance
+- Low Latency
+- Eventual Consistency
+- Idempotency
+
+---
+
+# 4. High-Level Architecture
+
+```
+                   Client
+                      │
+                Load Balancer
+                      │
+      ┌───────────────┴───────────────┐
+      │                               │
+ Swipe Service                 Swipe Service
+      │                               │
+      └───────────────┬───────────────┘
+                      │
+                Cassandra Cluster
+                      │
+         Swipe stored with
+         publish_status=PENDING
+                      │
+              Event Publisher
+                      │
+                   Kafka Topic
+                      │
+            Match Service Consumers
+                      │
+          ┌───────────┴─────────────┐
+          │                         │
+     Match Table             MatchCreated Event
+                                       │
+          ┌──────────────┬─────────────┴───────────┐
+          │              │                         │
+    Notification       Chat                  Analytics
+```
+
+---
+
+# 5. Why Cassandra?
+
+Swipe workload characteristics
+
+```
+Huge Writes
+
+Small Reads
+
+Massive Scale
+```
+
+Cassandra advantages
+
+- Horizontally scalable
+- No single master
+- Excellent write throughput
+- Automatic replication
+- Fault tolerant
+- Multi datacenter support
+
+---
+
+# 6. Swipe Service
+
+Responsibility
+
+Only one responsibility
+
+```
+Persist every swipe.
+```
+
+NOT responsible for
+
+- Match Detection
+- Notifications
+- Chat
+- Analytics
+
+---
+
+API
+
+```
+POST /swipe
+```
+
+Request
+
+```json
+{
+  "fromUser":100,
+  "toUser":200,
+  "action":"RIGHT"
+}
+```
+
+---
+
+Validation
+
+- JWT
+- User exists
+- Cannot swipe self
+- Action valid
+
+---
+
+After validation
+
+Write to Cassandra
+
+Return
+
+```
+200 OK
+```
+
+Everything else happens asynchronously.
+
+---
+
+# 7. Cassandra Data Modeling
+
+## Query First
+
+Queries
+
+```
+Q1
+
+Store Swipe
+```
+
+```
+Q2
+
+Did User A swipe User B?
+```
+
+```
+Q3
+
+Fetch swipes of User A
+```
+
+---
+
+Partition Key
+
+```
+from_user
+```
+
+---
+
+Clustering Key
+
+```
+to_user
+```
+
+---
+
+Schema
+
+```sql
+CREATE TABLE user_swipes (
+
+    from_user BIGINT,
+
+    bucket SMALLINT,
+
+    to_user BIGINT,
+
+    action TINYINT,
+
+    created_at TIMESTAMP,
+
+    publish_status TEXT,
+
+    event_id UUID,
+
+    PRIMARY KEY(
+        (from_user,bucket),
+        to_user
+    )
+
+);
+```
+
+---
+
+Why Bucket?
+
+Without bucket
+
+```
+Partition(User1)
+
+↓
+
+Millions of rows
+```
+
+Huge partitions are bad.
+
+Problems
+
+- Slow compaction
+- Large SSTables
+- High repair cost
+- Read amplification
+
+---
+
+Bucket
+
+```
+bucket = hash(toUser)%20
+```
+
+Partition
+
+```
+(User1,5)
+
+(User1,11)
+
+(User1,18)
+```
+
+instead of
+
+```
+(User1)
+```
+
+---
+
+# 8. Cassandra Internals
+
+## Partition
+
+Partition
+
+NOT
+
+Machine
+
+Partition means
+
+```
+All rows having same partition key.
+```
+
+Example
+
+```
+Partition(User100)
+
+↓
+
+User200
+
+User500
+
+User800
+```
+
+---
+
+## Hash
+
+Cassandra hashes
+
+```
+Partition Key
+```
+
+Example
+
+```
+Hash(User100)
+
+↓
+
+843278927
+```
+
+Hash decides
+
+Which node stores the partition.
+
+---
+
+## Token
+
+Token
+
+=
+
+Hash Value
+
+Example
+
+```
+User100
+
+↓
+
+Token
+
+843278927
+```
+
+---
+
+## Token Ring
+
+Imagine
+
+```
+0 --------------------------> 2^64
+```
+
+arranged in circle.
+
+Each node owns
+
+Token Range
+
+Example
+
+```
+Node1
+
+0-100
+```
+
+```
+Node2
+
+100-300
+```
+
+```
+Node3
+
+300-700
+```
+
+Hash determines
+
+which node owns the partition.
+
+---
+
+## Coordinator Node
+
+Client can connect
+
+to ANY Cassandra node.
+
+Example
+
+```
+Client
+
+↓
+
+Node2
+```
+
+Actual owner
+
+```
+Node4
+```
+
+Node2
+
+- computes hash
+- identifies replicas
+- forwards request
+- waits for consistency
+- returns response
+
+Node2
+
+=
+
+Coordinator
+
+Every Cassandra node can become coordinator.
+
+No master.
+
+---
+
+## Replication
+
+Replication Factor
+
+```
+RF=3
+```
+
+means
+
+Three copies of data.
+
+Example
+
+```
+Primary
+
+Node5
+
+Replica
+
+Node7
+
+Replica
+
+Node8
+```
+
+---
+
+Consistency
+
+Example
+
+LOCAL_QUORUM
+
+Coordinator waits
+
+for majority
+
+before acknowledging.
+
+---
+
+# 9. Swipe Write Path
+
+Request
+
+```
+User100
+
+RIGHT
+
+User200
+```
+
+Flow
+
+```
+Swipe API
+
+↓
+
+Hash(fromUser)
+
+↓
+
+Coordinator
+
+↓
+
+Replica Nodes
+
+↓
+
+Write Success
+```
+
+At same time
+
+```
+publish_status=PENDING
+```
+
+is stored.
+
+---
+
+# 10. Event Publishing
+
+Immediately after swipe
+
+Publisher service continuously checks
+
+```
+publish_status=PENDING
+```
+
+Flow
+
+```
+Pending Event
+
+↓
+
+Kafka
+
+↓
+
+Success
+
+↓
+
+Update
+
+publish_status=PUBLISHED
+```
+
+---
+
+If Kafka Down
+
+```
+Remain
+
+PENDING
+```
+
+Publisher retries.
+
+No event lost.
+
+---
+
+# 11. Match Service
+
+Consumes
+
+```
+SwipeCreated
+```
+
+events.
+
+Responsibility
+
+Only
+
+```
+Detect Mutual Like
+```
+
+---
+
+Flow
+
+Receive
+
+```
+100
+
+RIGHT
+
+200
+```
+
+Read reverse
+
+```
+Did
+
+200
+
+RIGHT
+
+100
+```
+
+exist?
+
+If No
+
+Stop.
+
+If Yes
+
+Create Match.
+
+---
+
+# 12. Match Table
+
+Always normalize.
+
+Never store
+
+```
+200
+
+100
+```
+
+Store
+
+```
+(min,max)
+```
+
+Example
+
+```
+100
+
+200
+```
+
+Schema
+
+```sql
+CREATE TABLE matches(
+
+    user_low BIGINT,
+
+    user_high BIGINT,
+
+    matched_at TIMESTAMP,
+
+    PRIMARY KEY(user_low,user_high)
+
+);
+```
+
+---
+
+Insert
+
+```
+INSERT
+
+IF NOT EXISTS
+```
+
+Only one succeeds.
+
+---
+
+# 13. Why Normalize?
+
+Without normalization
+
+Two requests
+
+```
+100→200
+```
+
+and
+
+```
+200→100
+```
+
+can create
+
+```
+100-200
+```
+
+and
+
+```
+200-100
+```
+
+Duplicate match.
+
+Normalization prevents this.
+
+---
+
+# 14. Kafka
+
+Topic
+
+```
+SwipeEvents
+```
+
+Partition Key
+
+```
+fromUser
+```
+
+Advantages
+
+- Ordering
+- Scalability
+- Parallel Consumers
+
+Consumers
+
+- Match
+- Analytics
+- Fraud
+- ML Pipeline
+
+---
+
+# 15. Failure Scenarios
+
+## Scenario 1
+
+Swipe stored
+
+Kafka Down
+
+Solution
+
+```
+publish_status=PENDING
+```
+
+Retry later.
+
+---
+
+## Scenario 2
+
+Publisher crashes
+
+after Kafka publish
+
+before updating status.
+
+Result
+
+Kafka receives duplicate.
+
+Solution
+
+Idempotent consumer.
+
+---
+
+## Scenario 3
+
+Client retries
+
+Same swipe.
+
+Primary key
+
+```
+(from_user,bucket,to_user)
+```
+
+Upsert.
+
+Safe.
+
+---
+
+## Scenario 4
+
+Two Match Consumers
+
+detect match simultaneously.
+
+Solution
+
+```
+(min,max)
+
++
+
+IF NOT EXISTS
+```
+
+---
+
+## Scenario 5
+
+Notification Down
+
+Match remains.
+
+Kafka retries later.
+
+---
+
+## Scenario 6
+
+Replica Node crashes.
+
+RF=3
+
+Coordinator writes
+
+other replicas.
+
+Repair later.
+
+---
+
+## Scenario 7
+
+Coordinator crashes
+
+during write.
+
+Client retries.
+
+Upsert.
+
+Safe.
+
+---
+
+# 16. Idempotency
+
+Very important.
+
+Everything should tolerate retries.
+
+Swipe
+
+```
+Same PK
+
+↓
+
+Overwrite
+```
+
+Publisher
+
+```
+Same Event
+
+↓
+
+Safe
+```
+
+Match
+
+```
+IF NOT EXISTS
+```
+
+Notification
+
+```
+eventId
+
+already processed
+
+↓
+
+Ignore
+```
+
+---
+
+# 17. Exactly Once?
+
+Impossible to guarantee
+
+across
+
+```
+Database
+
++
+
+Kafka
+
++
+
+Consumers
+```
+
+Industry standard
+
+```
+At Least Once Delivery
+
++
+
+Idempotent Consumers
+```
+
+---
+
+# 18. Database Tables
+
+## Swipe
+
+```sql
+PRIMARY KEY
+(
+(from_user,bucket),
+to_user
+)
+```
+
+Columns
+
+```
+action
+
+created_at
+
+event_id
+
+publish_status
+```
+
+---
+
+## Match
+
+```sql
+PRIMARY KEY
+(
+user_low,
+user_high
+)
+```
+
+Columns
+
+```
+matched_at
+```
+
+---
+
+# 19. Complete Flow
+
+```
+User Swipes
+
+↓
+
+Swipe API
+
+↓
+
+Validate
+
+↓
+
+Store Swipe
+
+publish_status=PENDING
+
+↓
+
+Return 200
+
+↓
+
+Publisher
+
+↓
+
+Kafka
+
+↓
+
+Match Consumer
+
+↓
+
+Read Reverse Swipe
+
+↓
+
+Mutual Like?
+
+↓
+
+No
+
+↓
+
+Stop
+
+-------------------------
+
+Yes
+
+↓
+
+Insert Match
+
+↓
+
+Publish MatchCreated
+
+↓
+
+Notification
+
+↓
+
+Chat
+
+↓
+
+Analytics
+```
+
+---
+
+# 20. Scaling Strategy
+
+## Swipe API
+
+Scale horizontally.
+
+Behind Load Balancer.
+
+---
+
+## Cassandra
+
+Add nodes.
+
+Automatic partition distribution.
+
+---
+
+## Kafka
+
+Increase partitions.
+
+Increase consumers.
+
+---
+
+## Match Service
+
+Consumer Group.
+
+More instances.
+
+---
+
+Everything scales independently.
+
+---
+
+# 21. Important Design Decisions
+
+| Problem | Solution |
+|----------|----------|
+| Massive Writes | Cassandra |
+| Duplicate Swipes | Composite Primary Key |
+| Huge Partitions | Bucketing |
+| Match Detection | Reverse Lookup |
+| Duplicate Matches | Normalize + LWT |
+| Kafka Failure | publish_status=PENDING |
+| Publisher Crash | Retry |
+| Duplicate Events | Idempotency |
+| Retry Safety | Upsert |
+| High Throughput | Async Architecture |
+| Ordering | Kafka Partition by User |
+| Horizontal Scaling | Stateless Services |
+
+---
+
+# 22. Interview Questions You Should Be Ready For
+
+### Why Cassandra instead of MySQL?
+
+Because swipe traffic is write-heavy, Cassandra scales horizontally, provides very high write throughput, and avoids a single write master.
+
+---
+
+### Why bucket partitions?
+
+To avoid extremely large partitions for highly active users.
+
+---
+
+### Why Kafka?
+
+To decouple Swipe Service from Match, Notification, Chat, Analytics, and other downstream consumers.
+
+---
+
+### Why asynchronous processing?
+
+Users should receive a swipe acknowledgment immediately without waiting for match detection or notifications.
+
+---
+
+### Why normalize `(min(user1, user2), max(user1, user2))`?
+
+To ensure a pair of users has exactly one canonical match record.
+
+---
+
+### Why use `INSERT IF NOT EXISTS`?
+
+To prevent duplicate match creation when two consumers detect the same mutual like concurrently.
+
+---
+
+### Why store `publish_status=PENDING`?
+
+To guarantee that swipe events are eventually published even if Kafka or the publisher is temporarily unavailable.
+
+---
+
+### Why are idempotent consumers required?
+
+Because retries and duplicate event delivery are expected in distributed systems. Consumers must safely process the same event more than once.
+
+---
+
+### Why not call Match Service synchronously?
+
+That would increase user-facing latency, tightly couple services, and reduce resilience if Match Service becomes slow or unavailable.
+
+---
+
+# 23. Possible Future Improvements
+
+- Redis cache for faster reverse-like checks.
+- Geographically partitioned Cassandra clusters.
+- Multi-region Kafka replication.
+- CDC (Change Data Capture) instead of application-managed event publishing.
+- Dead Letter Queues (DLQ) for permanently failing events.
+- Rate limiting and abuse detection for bots and spam.
+- Event versioning for backward-compatible schema evolution.
+- Metrics, tracing, and observability (Prometheus, Grafana, OpenTelemetry).
+- Online/offline recommendation pipelines using ML.
+- Soft deletes and TTL for certain swipe types if business rules require them.
+
+---
+
+# Final Architecture
+
+```
+                        Client
+                           │
+                    Load Balancer
+                           │
+                Stateless Swipe APIs
+                           │
+                 Cassandra Cluster
+          (Swipe + Event Metadata Stored)
+                           │
+            publish_status = PENDING
+                           │
+                  Event Publisher
+                           │
+                         Kafka
+                           │
+                  Match Consumers
+                           │
+              Reverse Swipe Lookup
+                           │
+                  Mutual Like Found?
+                           │
+                    INSERT IF NOT EXISTS
+                           │
+                  MatchCreated Event
+                           │
+     ┌──────────────┬──────────────┬──────────────┐
+     │              │              │
+Notification       Chat        Analytics
+```
+
+---
+
+# Key Takeaways
+
+1. **Model Cassandra tables around queries, not relationships.**
+2. **Use partition keys carefully to distribute data uniformly.**
+3. **Avoid oversized partitions by introducing deterministic buckets.**
+4. **Keep the synchronous path short: validate, persist, acknowledge.**
+5. **Publish events asynchronously to decouple downstream services.**
+6. **Never assume Kafka publishes are atomic with database writes.**
+7. **Persist event metadata with the swipe so failed publishes can be retried.**
+8. **Design every operation to be idempotent because retries are inevitable.**
+9. **Normalize user pairs before creating matches to avoid duplicates.**
+10. **Prefer at-least-once delivery with idempotent processing over chasing true end-to-end exactly-once semantics.**
+
+![alt text](image-36.png)
+
+![alt text](image-37.png)
+
+![alt text](image-38.png)
+
+- because redis can take so much space we can again show the same profile in may be 30-60 days right.
